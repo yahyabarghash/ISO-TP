@@ -1,0 +1,986 @@
+/* --- License ------------------------------------------------------------- */
+
+
+/* --- Module Description -------------------------------------------------- */
+/**
+ * \file    packet_scheduler.c
+ * \author  Institute for reliable Embedded Systems
+            and Communication Electronics
+ * \date    2016-01-25
+ * \version 0.1
+ *
+ * \brief   To handle the transmission and the reception of the packets
+ */
+
+/* --- Includes ------------------------------------------------------------ */
+#include "packet_scheduler.h"
+#include "logger.h"
+
+
+/* --- Macro Definitions --------------------------------------------------- */
+#define LOGGER_ENABLE 0
+#define LOGGER_LEVEL 3
+
+
+#define MAXNOPACKETS 40
+#define MAXPCKBUFSIZE 4096
+
+/* for 100usec */
+#define TXTIMEOUT 100000
+#define RXTIMEOUT 100000
+
+#define FCTYPE 0x30
+#define CFTYPE 0x20
+/* --- Type Definitions ---------------------------------------------------- */
+
+
+/* --- Variables ----------------------------------------------------------- */
+static st_packetInfTx_t a_packetInfoTx[MAXNOPACKETS];
+/* original data*/
+static uint8_t*     p_schBuf[MAXNOPACKETS];
+static uint8_t*     p_schBufFrame[MAXNOPACKETS];
+static uint8_t      _flag = 0;
+static uint16_t     _packetId = 0;
+static uint16_t     _totPacketsSize = 0;
+static uint16_t     _currentPacketID = 0;
+static uint16_t     _BSTXCurrent = 0;
+/* this flag to indicate if the current pakcet is new or not
+ * if 1 then new packet and then you have to configure the isotpreceive
+ */
+static uint8_t      _EndOfPacket = 0;
+static en_packetState_t _TxState = FF_NOTSENT;
+static uint16_t     _numberMessages;
+static int8_t       _SN;
+static uint8_t      come_bfore_FF_SENT_FC_NOTRECEIVED = 0;
+static en_frameType_t  _Frame_type;
+static uint8_t      _FF_sent;
+static uint8_t      _CFInMailBox = 0;
+static uint8_t      _currentMailBox;
+en_nResult_t        _n_result = N_OK;
+/*for the timers*/
+static uint32_t     _N_Bs = 1;
+static uint32_t     _N_Cs = 1;
+static uint32_t     _N_As = 1;
+static uint32_t     _Stmin = 1;
+static uint32_t     _timeOut = 1;
+static uint8_t      _CFSent = 0;
+static st_FCConf_t  _st_FCConf_t_Tx;
+static st_FCConf_t  _st_FCConf_t_Rx;
+static uint32_t     _endRemaining;
+uint8_t             _FC_rx;
+static uint8_t      _FCReceived;
+
+/*
+ * tprecieve variables
+ */
+static uint8_t      _BS = 3;
+static uint32_t     _N_Br = 1;
+static uint32_t     _N_Cr = 1;
+static uint32_t     _N_Ar = 1;
+static en_typeTimeout_t  tTimeout = Ar;
+static en_outerState_t  _oState = START;
+static en_innerState_t  _iState = RECEIVING_FF;
+static en_NResultRx_t  _nResultRx = N_OK_Rx;
+static uint8_t      _endMessage = 0;
+static uint8_t      _timeBefore = 1;
+static uint16_t     _BSRXCurrent = 0;
+
+static st_PacketInfRx_t packetInfoRx;
+
+
+/* --- Local Functions Declaration ----------------------------------------- */
+
+void HandleDataNonExist(void);
+en_NResultRx_t HandleDataExist( uint8_t d_len, s_ringb_t* data_rx_buff);
+
+/* --- Global Functions Definition ----------------------------------------- */
+
+/* It adds the new packet to the list of the packets*/
+en_nResult_t sendPacket( e_can_if_t e_if, uint8_t *pload, uint32_t srcID, uint32_t destID, uint16_t size )
+{
+
+
+    if ( size+_totPacketsSize<MAXPCKBUFSIZE )
+    {
+        a_packetInfoTx[_packetId].e_if = e_if;
+        a_packetInfoTx[_packetId].srcID = srcID;
+        a_packetInfoTx[_packetId].destID = destID;
+        a_packetInfoTx[_packetId].packetID  = _packetId;
+        a_packetInfoTx[_packetId].size = size;
+        a_packetInfoTx[_packetId].packetTxStatus = TxStatus_Pending;
+        p_schBuf[_packetId] = pload;
+        p_schBufFrame[_packetId] = pload;
+        _totPacketsSize += size;
+        _packetId++;
+        _numberMessages++;
+        _n_result = N_OK;
+        LOG2_OK( "packet no %d added!", _packetId );
+    }
+    else
+    {
+        _n_result = N_BUFFER_OVFLW;  // No space for the new packet
+        LOG2_OK( "No space for storing the new packet!", 2 );
+    }
+    return _n_result;
+}
+
+
+
+void initTp()
+{
+    initCLK();
+
+}
+
+void tpRxConf( uint8_t BSConf, uint8_t StminConf, uint16_t srcID, uint16_t destID, e_can_if_t e_if )
+{
+    _st_FCConf_t_Rx.BS = BSConf;
+    _st_FCConf_t_Rx.STmin = StminConf;
+    _st_FCConf_t_Rx.srcID = srcID;
+    _st_FCConf_t_Rx.destID = destID;
+    _st_FCConf_t_Rx.e_if = e_if;
+}
+
+
+en_nResult_t isotpEntryTx()
+{
+        en_nResult_t nResult;
+        /* 10000 for 100usec, 100000 for 10usec */
+        int8_t retval = 0;
+
+        if ( a_packetInfoTx[_currentPacketID].size > 7 && _numberMessages > 0 ) //the payload of the SF is 7 bytes )
+        {
+            switch ( _TxState ) {
+                case FF_NOTSENT:
+                    //initCLK();
+                    /*
+                     * reset the Ticks for TXclck to avoid over flow
+                     */
+                    resetTicksTx();
+                    _CFInMailBox = 0;
+                    LOG2_OK( "Multiple frame has been found to send" );
+                    LOG2_OK( "Trying to send the first frame!" );
+                    setTxLED();
+                    _SN = 0;
+                    retval = writePacket();
+                    _EndOfPacket = 0;
+                    if ( retval != CAN_TxStatus_NoMailBox )
+                    {
+                        LOG_HEXDUMP( p_schBuf[_packetId - 1], a_packetInfoTx[_packetId - 1].size );
+                        LOG2_OK( "The first frame has been sent" );
+                        _TxState = FF_SENT_FC_NOTRECEIVED;
+                        _N_Bs = getTicksTx() + TXTIMEOUT;
+                        LOG2_OK( "Time stamp( N_Bs ): %d", _N_Bs );
+                        retval = N_OK;
+                        nResult = N_OK;
+                    }
+                    break;
+                case FF_SENT_FC_NOTRECEIVED:
+//                    if ( FC_rx == 1 ){
+//                        FC_received = 1;
+//                        st_FCConf_t_TX = getFC();
+//                    }
+                    /*
+                     * check if the FC has been received or not
+                     */
+                    if ( getFCRxFlag() == 1 )
+                    {
+                        _FCReceived = 1;
+                        _st_FCConf_t_Tx = getFC();
+                    }
+                    /*
+                     * check if the FC received and N_Bs not time out
+                     */
+                    if ( getFCRxFlag() == 1 && _N_Bs >= getTicksTx())
+                    {
+                        // checks if N_Bs is not time out yet
+                        LOG2_OK( "Time stamp( N_Bs ): %d", _N_Bs );
+                        LOG2_OK( "The flow control has been received" );
+                        _N_As = getTicksTx() + TXTIMEOUT;
+                        LOG1_OK( "Time stamp( _N_As ): %d", _N_As );
+                        if ( !_CFInMailBox )
+                            _currentMailBox = writePacket();
+                       // LOG2_OK( "Trying to send the first consecutive frame" );
+
+                        if ( isTransmitted( _st_FCConf_t_Tx.e_if, _currentMailBox ) && _currentMailBox != CAN_TxStatus_NoMailBox && !_EndOfPacket && _N_As >= getTicksTx())
+                        {
+                            _CFInMailBox = 0;
+                            ResetFCRxFlag();
+                            LOG2_OK( "Time stamp( _N_As ): %d", getTicksTx());
+                            LOG2_OK( "Sending the 1st consecutive frame succeeded" );
+                            _N_Cs = getTicksTx() + TXTIMEOUT;
+                            _Stmin = getTicksTx() + _st_FCConf_t_Tx.STmin;
+                            LOG2_OK( "Time stamp( N_Cs ): %d", _N_Cs );
+                            come_bfore_FF_SENT_FC_NOTRECEIVED = 0;
+                            _BSTXCurrent++;
+                            _TxState = FC_RECEIVED_CF_SENT;
+                            if ( _BSTXCurrent >= _st_FCConf_t_Tx.BS )
+                            {
+                                _N_Bs = getTicksTx()+TXTIMEOUT;
+                                LOG2_OK( "Time stamp( _N_Cs ): %d", _N_Bs );
+                                _TxState = FF_SENT_FC_NOTRECEIVED;
+                                _BSTXCurrent = 0;
+                            }
+                            _CFSent = 1;
+                        }
+                        else if ( retval != CAN_TxStatus_NoMailBox && _EndOfPacket ) //at the end of the packet sending
+                        {
+                            nResult = MESSAGE_COMPLETE_TX;
+                            retval = MESSAGE_COMPLETE_TX;
+                            LOG2_OK( "Message Complete" );
+                            resetTxLED();
+                            _BSTXCurrent = 0;
+                            _TxState = FF_NOTSENT;
+                            _CFSent = 1;
+                            resetPacketInfoTx();
+                        }
+                        else if ( _N_As < getTicksTx())
+                        {
+                            LOG1_OK( "Time out _N_As, %d", getTicksTx());
+                            LOG1_OK( " _N_As, %d", _N_As );
+                            nResult = N_TIMEOUT_As;
+                            retval = nResult;
+                            _BSTXCurrent = 0;
+                            resetTxLED();
+                            _TxState = FF_NOTSENT;
+                            _N_As = 1;
+                            _numberMessages--;
+                            //return n_result;
+                        }
+                    }
+                    else if ( _N_Bs<getTicksTx())
+                    {
+                        // if time out then abort transmission and return N_TIMEOUT_Bs
+                        LOG2_OK( "Time out N_Bs, %d, N_Bs:%d", getTicksTx(), _N_Bs );
+                        nResult = N_TIMEOUT_Bs;
+                        retval = nResult;
+                        _BSTXCurrent = 0;
+                        _TxState = FF_NOTSENT;
+                        resetTxLED();
+                        _N_Bs = 1;
+                        _numberMessages--;
+                    }
+                    break;
+                case FC_RECEIVED_CF_SENT:
+                    if ( _N_Cs > _N_As )
+                        _timeOut = _N_Cs;
+                    else
+                        _timeOut = _N_As;
+
+                    if ( _st_FCConf_t_Tx.BS > _BSTXCurrent && _timeOut >= getTicksTx() && _Stmin < getTicksTx())
+                    {
+                        LOG2_OK( "Time stamp( _N_Cs ): %d", _N_Cs );
+                        _N_As = getTicksTx() + TXTIMEOUT;
+                        LOG2_OK( "Time stamp( _N_As ): %d", _N_As );
+                        LOG2_OK( "Trying to send consecutive frame no %d", _BSTXCurrent );
+                        LOG2_OK( "Time stamp( Ticks ): %d", getTicksTx());
+                        if ( !_CFInMailBox )
+                        {
+                            _currentMailBox =  writePacket();
+                        }
+                        if ( isTransmitted( _st_FCConf_t_Tx.e_if, _currentMailBox ) && _currentMailBox !=  CAN_TxStatus_NoMailBox && _N_As >= getTicksTx() && !_EndOfPacket )
+                        {
+                            _CFInMailBox = 0;
+                            LOG2_OK( "Consecutive frame %d has been sent", _BSTXCurrent );
+                            _N_Cs = getTicksTx()+TXTIMEOUT;
+                            _Stmin = getTicksTx()+_st_FCConf_t_Tx.STmin;
+                            LOG2_OK( "Time stamp: %d", getTicksTx());
+                            LOG2_OK( "Time stamp( _Stmin ): %d", _Stmin );
+                            LOG2_OK( "Time stamp( _N_Cs ): %d", _N_Cs );
+                            _BSTXCurrent++;
+                            if ( _BSTXCurrent >= _st_FCConf_t_Tx.BS )
+                            {
+                                _TxState = FF_SENT_FC_NOTRECEIVED;
+                                _N_Bs = getTicksTx()+TXTIMEOUT;
+                                LOG2_OK( "Time stamp( N_Bs ): %d", _N_Bs );
+                                _BSTXCurrent = 0;
+                            }
+                        }
+                        else if ( _EndOfPacket )
+                        {
+                            nResult = MESSAGE_COMPLETE_TX;
+                            retval = MESSAGE_COMPLETE_TX;
+                            resetTxLED();
+                            //GPIO_ResetBits( GPIOD, GPIO_Pin_13 );
+                            LOG1_OK( "Message Complete!" );
+                            //resetSCHTx();
+                            _BSTXCurrent = 0;
+                            _TxState = FF_NOTSENT;
+                            p_schBufFrame[_currentPacketID] += _endRemaining;
+                            _SN = 0;
+
+                            _numberMessages--;
+                            _currentPacketID++;
+                            _Frame_type = FF;
+                            if ( _currentPacketID == MAXNOPACKETS )
+                                _currentPacketID = 0;
+                            else
+                            {
+                                a_packetInfoTx[_currentPacketID].packetTxStatus = TxStatus_Loaded;
+                               // current_packet_id++;
+                                a_packetInfoTx[_currentPacketID].packetTxStatus = TxStatus_Proccessing;
+                            }
+                            resetPacketInfoTx();
+                        }
+                        else if ( _N_As < getTicksTx())
+                        {
+                            LOG2_OK( "Time out _N_As: %d", getTicksTx());
+                            nResult = N_TIMEOUT_As;
+                            retval = nResult;
+                            _BSTXCurrent = 0;
+                            resetTxLED();
+                            _TxState = FF_NOTSENT;
+                            _numberMessages--;
+                        }
+                    }
+                    else if ( _N_Cs < getTicksTx())
+                    {
+                        LOG2_OK( "Time out _N_Cs: %d, %d", getTicksTx(), _N_Cs );
+                        nResult = N_TIMEOUT_Cs;
+                        retval = nResult;
+                        _BSTXCurrent = 0;
+                        resetTxLED();
+                        _TxState = FF_NOTSENT;
+                        _numberMessages--;
+                    }
+                    break;
+                default:
+                    break;
+            }
+            //retval = N_OK;
+        }
+        else if ( a_packetInfoTx[_currentPacketID].size <= 7 && _numberMessages > 0 )// if single message
+        {
+            LOG2_OK( "Sending single frame" );
+            _N_As = getTicksTx() + TXTIMEOUT;
+            LOG2_OK( "Time stamp( _N_As ): %d", _N_As );
+            retval = writePacket();
+            if ( retval == CAN_TxStatus_NoMailBox )
+            {
+                LOG2_OK( "Can not send the single frame" );
+                nResult = N_ERROR_Tx;
+                retval = N_ERROR;
+            }
+            else if ( retval != CAN_TxStatus_NoMailBox && _N_As >= getTicksTx())
+            {
+                LOG2_OK( "Single frame has been successfully sent!" );
+                retval = N_OK;
+                nResult = N_OK;
+                resetPacketInfoTx();
+            }
+            else if ( _N_As < getTicksTx())
+            {
+                LOG2_OK( "Time out _N_As: %d", getTicksTx());
+                nResult = N_TIMEOUT_As;
+                _BSTXCurrent = 0;
+                resetTxLED();
+                _TxState = FF_NOTSENT;
+
+                _numberMessages--;
+            }
+        }
+    return nResult;
+}
+
+
+void isotpEntry( uint8_t *txflag, uint8_t *rxflag )
+{
+
+    //LOG_HEXDUMP( sch_buf, 8 );
+    *txflag = isotpEntryTx();
+    *rxflag = isotpEntryRx();
+
+}
+
+uint8_t isotpEntryRx()
+{
+    uint8_t retval;
+    uint8_t local_frame[3];
+
+    if ( _iState == SENDING_FC && _oState == MULTIPLE_FRAME )
+    {
+       // LOG2_OK( "Trying to send the flow control" );
+        local_frame[0] = FCTYPE;     //Type|FS
+        local_frame[1] = _st_FCConf_t_Rx.BS;     //BS
+        local_frame[2] = _st_FCConf_t_Rx.STmin;     //stmin
+        retval = isoTpsend( _st_FCConf_t_Rx.e_if, local_frame, _st_FCConf_t_Rx.srcID, 3 ); //send the FC
+        if ( retval != CAN_TxStatus_NoMailBox )
+        {
+            LOG2_OK( "The flow control has been sent" );
+            _iState = RECEIVING_CF;
+            //RECEIVING_CFset_istate_receiving_cf();
+        }
+    }
+    else
+    {
+        retval = tpRcv();
+       // if ( current_packet_id )
+    }
+return retval;
+
+}
+
+uint8_t tpRcv()
+{
+    uint8_t nibble2;
+    //e_can_if_t e_if;
+    uint8_t* pc_pload;
+    uint16_t pc_ploadLen;
+    en_NResultRx_t retval;
+    int8_t ret = -1;
+    uint8_t local_frame[3];
+    uint8_t d_len;
+    uint16_t data_exist;
+    uint8_t d_buff[10];
+    s_ringb_t *data_rx_buff;
+    s_ringb_t *data_len_rx_buff;
+    e_can_if_t e_if;
+    uint16_t c_id;
+
+    data_len_rx_buff = getDataLengthRxBuff();
+    data_rx_buff = getDataRxBuff();
+    ret = -1;
+    data_exist = ringb_pulla( data_len_rx_buff, &d_len );
+
+    /* If there is no data in the ring buffer
+     * check if the sate is SENDING_FC then try to send a flow control
+     * or if there is timeout then handle it
+     */
+    if ( data_exist == 0 )
+    {
+        HandleDataNonExist();
+    }
+    /*
+     * if there is a frame in the ring buffer then handle it
+     */
+    else
+    {
+        HandleDataExist( d_len, &data_rx_buff );
+    }
+return retval;
+}
+
+
+uint8_t writePacket()
+{
+    uint8_t retval;
+    uint16_t remaining_size;
+    uint8_t frame_sent[8];
+    remaining_size = a_packetInfoTx[_currentPacketID].size-( p_schBufFrame[_currentPacketID] - p_schBuf[_currentPacketID] );
+    if ( a_packetInfoTx[_currentPacketID].size <= 7 )
+    {         //single message
+        frame_sent[0] = ( a_packetInfoTx[_currentPacketID].size );
+        for ( uint16_t i = 0;  i < a_packetInfoTx[_currentPacketID].size;  i++ )
+        {
+            frame_sent[i+1] = ( *( p_schBufFrame[_currentPacketID]+i ));
+        }
+       // retval = can_send( packet_info_Tx[current_packet_id].e_if, packet_info_Tx[current_packet_id].src_id, &frame_sent, packet_info_Tx[current_packet_id].size+1 );
+         retval = isoTpsend( a_packetInfoTx[_currentPacketID].e_if, &frame_sent, a_packetInfoTx[_currentPacketID].srcID, a_packetInfoTx[_currentPacketID].size + 1 );
+
+       if ( retval != CAN_TxStatus_NoMailBox )
+        {
+            _numberMessages--;
+            _currentPacketID++;
+        }
+
+        return retval;  // to be removed
+    }
+    else
+    {  // multiple frames
+        if ( _Frame_type == FF ) //for FF
+        {
+            uint16_t tmpv;
+            frame_sent[0] = 0x10 | ( a_packetInfoTx[_currentPacketID].size >> 8 );
+            tmpv = a_packetInfoTx[_currentPacketID].size >> 8;
+            tmpv = ( uint8_t )a_packetInfoTx[_currentPacketID].size;
+            frame_sent[1] = ( uint8_t )a_packetInfoTx[_currentPacketID].size;
+
+            for ( uint8_t count = 0;  count < 6;  count++ )
+                frame_sent[count + 2] = p_schBufFrame[_currentPacketID][count];
+
+            retval = isoTpsend( a_packetInfoTx[_currentPacketID].e_if, &frame_sent[0], a_packetInfoTx[_currentPacketID].srcID, 8 );
+
+            if ( retval != CAN_TxStatus_NoMailBox )
+            {
+                a_packetInfoTx[_currentPacketID].Mail_box = retval;
+                p_schBufFrame[_currentPacketID] += 6;
+                a_packetInfoTx[_currentPacketID].packetTxStatus = TxStatus_Proccessing;
+                _Frame_type = CF;
+                _FF_sent = 1;
+
+            }
+        }
+        else //in case of CF
+        {
+            if ( remaining_size > 7 ) //check if the remaining size is more than 7 bytes ( more than one frame in standard addressing )
+            {
+                if ( _SN>14 )
+                    _SN = -1;
+                if ( _FF_sent == 1 )
+                {
+                    _SN = 0;
+                    _FF_sent = 0;
+                }
+                _SN++;
+                frame_sent[0] = CFTYPE | _SN;
+                for ( uint8_t count = 1; count < 8; count++ )
+                    frame_sent[count] = *( p_schBufFrame[_currentPacketID] + count - 1 );
+                retval = isoTpsend( a_packetInfoTx[_currentPacketID].e_if, frame_sent, a_packetInfoTx[_currentPacketID].srcID, 8 );
+                if ( retval != CAN_TxStatus_NoMailBox )
+                {
+                    _CFInMailBox = 1;
+                    a_packetInfoTx[_currentPacketID].Mail_box = retval;
+                    p_schBufFrame[_currentPacketID] += 7;
+                    a_packetInfoTx[_currentPacketID].packetTxStatus = TxStatus_Proccessing;
+                }
+
+
+            /* in case of the remaining size is less than 7 bytes then send them and then move to the next packet*/}
+            else
+            {
+                if ( _SN > 14 )
+                    _SN = -1;
+                _SN++;
+                frame_sent[0] = CFTYPE | _SN;
+
+                for ( uint8_t count = 0; count<remaining_size; count++ )
+                    frame_sent[count+1] = *( p_schBufFrame[_currentPacketID] + count );
+
+                retval = isoTpsend( a_packetInfoTx[_currentPacketID].e_if, frame_sent, a_packetInfoTx[_currentPacketID].srcID, remaining_size + 1 );
+
+                if ( retval != CAN_TxStatus_NoMailBox )
+                {
+                    _EndOfPacket = 1;
+                    a_packetInfoTx[_currentPacketID].Mail_box = retval;
+                    _endRemaining = remaining_size;
+
+                }
+            }
+        }
+    }
+    return retval;
+}
+
+
+uint8_t checkPacket( uint8_t p_id )
+{
+    uint8_t retval;
+    uint8_t retstate;
+    if ( a_packetInfoTx[p_id].packetTxStatus == TxStatus_Loaded )
+    {
+        retstate = iso_CAN_TxStatus( a_packetInfoTx[p_id].e_if, a_packetInfoTx[p_id].Mail_box );
+        if ( retstate == 01 )
+            a_packetInfoTx[p_id].packetTxStatus = TxStatus_Ok;
+        else if ( retstate == 00 )
+            a_packetInfoTx[p_id].packetTxStatus = TxStatus_Failed;
+        else if ( retstate == 02 )
+            a_packetInfoTx[p_id].packetTxStatus = TxStatus_Loaded;
+    }
+    retval = a_packetInfoTx[p_id].packetTxStatus;
+    return retval;
+}
+
+void resetSCHRx()
+{
+    _BS = 3;
+    _N_Br = 1;
+    _N_Cr = 1;
+    _N_Ar = 1;
+    tTimeout = Ar;
+    _oState = START;
+    _iState = RECEIVING_FF;
+    _endMessage = 0;
+    _timeBefore = 1;
+    _BSRXCurrent = 0;
+}
+void resetSCHTx()
+{
+    _flag = 0;
+    _packetId = 0;
+    _totPacketsSize = 0;
+    _currentPacketID = 0;
+    _BSTXCurrent = 0;
+    _CFInMailBox = 0;
+    /*
+     * this flag to indicate if the current packet is new or not if 1 then new packet
+     * and then you have to configure the isotpreceive
+     */
+    _EndOfPacket = 0;
+    _TxState = FF_NOTSENT;
+    _numberMessages = 0;
+    _SN = 0;
+    come_bfore_FF_SENT_FC_NOTRECEIVED = 0;
+    _CFSent = 0;
+    _FCReceived = 0;
+}
+
+void resetPacketInfoTx()
+{
+
+    _totPacketsSize = a_packetInfoTx[0].size;
+    for ( uint8_t i = 0; i < _packetId; i++ )
+    {
+        a_packetInfoTx[i] = a_packetInfoTx[i+1];
+        p_schBuf[i] = p_schBuf[i+1];
+        p_schBufFrame[i] = p_schBufFrame[i+1];
+    }
+    _currentPacketID--;
+    _packetId--;
+}
+
+
+
+/* --- Local Functions Definition ----------------------------------------- */
+
+
+void HandleDataNonExist(void)
+{
+
+    uint8_t local_frame[3];
+    uint8_t ret;
+     if ( _iState == SENDING_FC )
+     {
+         //tpReceiveRoute( 0, 1, FC_callback );
+         LOG2_OK( "Trying to send the Flow control" );
+         local_frame[0] = FCTYPE;     //Type|FS
+         local_frame[1] = _st_FCConf_t_Rx.BS;     //BS
+         local_frame[2] = _st_FCConf_t_Rx.STmin;     //stmin
+         ret = isoTpsend( _st_FCConf_t_Rx.e_if, local_frame, _st_FCConf_t_Rx.srcID, 3 ); //send the FC
+         if ( ret != CAN_TxStatus_NoMailBox && _N_Ar >= getTicksRx())
+         {
+             LOG2_OK( "The flow control has been sent" );
+             LOG2_OK( "Time stamp( N_Ar ): %d", _N_Ar );
+             _iState = RECEIVING_CF;
+             LOG2_OK( "Trying to receive a consecutive frame" );
+             _N_Cr = getTicksRx() + RXTIMEOUT;
+             LOG2_OK( "Time stamp( N_Cr ): %d", _N_Cr );
+             tTimeout = Cr;
+         }
+         else if ( _N_Ar < getTicksRx())
+         {
+             resetRxLED();
+             LOG2_OK( "Time out( N_Ar ): %d", _N_Ar );
+             _nResultRx = N_TIMEOUT_Ar;
+             _oState = START;
+         }
+     }
+    if ( _oState != START )
+     if ( tTimeout == Ar )
+     {
+         _timeBefore = 1;
+         if ( _N_Ar < getTicksRx())
+         {
+             resetRxLED();
+             LOG2_OK( "Time out( N_Ar ): %d", getTicksRx());
+             _nResultRx = N_TIMEOUT_Ar;
+             _oState = START;
+         }
+     }
+     else if ( tTimeout == Br )
+     {
+         _timeBefore = 1;
+         if ( _N_Br < getTicksRx())
+         {
+             resetRxLED();
+             LOG2_OK( "Time out( N_Br ): %d", getTicksRx());
+             _nResultRx = N_TIMEOUT_Br;
+             _oState = START;
+         }
+     }
+     else if ( tTimeout == Cr )
+     {
+         _timeBefore = 1;
+         if ( _N_Cr < getTicksRx())
+         {
+             resetRxLED();
+             LOG2_OK( "Time out( N_Cr ): %d", getTicksRx());
+             _nResultRx = N_TIMEOUT_Cr;
+             _oState = START;
+         }
+     }
+}
+
+en_NResultRx_t HandleDataExist( uint8_t d_len, s_ringb_t* data_rx_buff)
+{
+    uint8_t nibble2;
+    //e_can_if_t e_if;
+    uint8_t* pc_pload;
+    uint16_t pc_ploadLen;
+    en_NResultRx_t retval;
+    int8_t ret = -1;
+    uint8_t local_frame[3];
+    uint16_t data_exist;
+    uint8_t d_buff[10];
+    s_ringb_t *data_len_rx_buff;
+    e_can_if_t e_if;
+    uint16_t c_id;
+    _timeBefore = 0;
+    ringb_pull( data_rx_buff, d_buff, d_len );
+    pc_pload = &d_buff[0];
+    pc_ploadLen = d_len - 2;
+    c_id = d_buff[d_len - 1];
+    c_id = ( c_id << 8 );
+    c_id = c_id | ( d_buff[d_len - 2] );
+    /*
+     * To get the highest nibble
+     */
+    nibble2 = ( *pc_pload ) & 0xF0;
+
+    if ( nibble2 == FCTYPE && c_id == a_packetInfoTx[_currentPacketID].destID )
+    {
+        LOG2_OK( "Calling the flow control callback function" );
+        retval = FC_callback( pc_pload );
+    }
+   else if ( _st_FCConf_t_Rx.destID == c_id )
+   {
+        switch( _oState )
+        {
+            case START:
+                setRxLED();
+                resetTicksRx();
+                _endMessage = 0;
+                _BSRXCurrent = 0;
+                if ( nibble2 == 0 )
+                {
+                    _oState = SINGLE_FRAME;
+                    LOG2_OK( "Receiving a single frame" );
+                    retval = isoTPHandleSingleFrame( e_if, c_id, pc_pload, pc_ploadLen );
+                    if ( retval == N_OK_Rx )
+                    {
+                        //LOG_HEXDUMP( pc_pload, pc_ploadLen );
+                        LOG2_OK( "The single frame has been received" );
+                        _oState = START;
+                    }
+
+                }
+                else if ( nibble2 == 0x10 )  //FF
+                {
+                    /*if ( istate == RECEIVING_FF && !End_Message )
+                    {
+                        return N_UNEXP_PDU_Rx;
+                    }*/
+                    LOG2_OK( "Receiving the First frame" );
+                    _N_Br = getTicksRx() + RXTIMEOUT;
+                    LOG2_OK( "Time stamp( N_Br+timeout ): %d", _N_Br );
+                    tTimeout = Br;
+                    _oState = MULTIPLE_FRAME;
+                    _iState = RECEIVING_FF;
+                    packetInfoRx.arbitration_id = c_id;
+                    packetInfoRx.e_if = e_if;
+                    packetInfoRx.size = pc_ploadLen;
+                    retval = isoTPHandleFirstFrame( packetInfoRx.e_if, packetInfoRx.arbitration_id, pc_pload, pc_ploadLen );
+
+                    if ( retval == N_BUFFER_OVFLW_Rx )
+                    {
+                        LOG2_OK( "Can not be stored ( Over flow )" );
+                        resetRxLED();
+                        _oState = START;
+                        _iState = RECEIVING_FF;
+                        return retval;
+                    }
+                    else if ( retval == N_OK_Rx && _N_Br >= getTicksRx())
+                    {
+
+                        //LOG_HEXDUMP( pc_pload, pc_ploadLen );
+                        //printf( "\n\r" );
+                        LOG2_OK( "Time stamp( N_Br ): %d", getTicksRx());
+                        LOG2_OK( "The first frame has been successfully stored" );
+                        _iState = SENDING_FC;
+                        local_frame[0] = FCTYPE;     //Type|FS
+                        local_frame[1] = _st_FCConf_t_Rx.BS;     //BS
+                        local_frame[2] = _st_FCConf_t_Rx.STmin;     //stmin
+                        _N_Ar = getTicksRx() + RXTIMEOUT;
+                        LOG2_OK( "Time stamp( N_Ar+timeout ): %d", _N_Ar );
+                        LOG2_OK( "Sending the flow control" );
+                        tTimeout = Ar;
+                        retval = isoTpsend( _st_FCConf_t_Rx.e_if, local_frame, _st_FCConf_t_Rx.srcID, 3 );
+                        if ( ret != CAN_TxStatus_NoMailBox && _N_Ar >= getTicksRx())
+                        {
+                            LOG2_OK( "Time stamp( N_Ar ): %d", getTicksRx());
+                            LOG2_OK( "The flow control has been sent" );
+                            _iState = RECEIVING_CF;
+
+                            _N_Cr = getTicksRx() + RXTIMEOUT;
+                            LOG2_OK( "Time stamp( N_Cr+timeout ): %d", _N_Cr );
+                            LOG2_OK( "Receiving the consecutive frames" );
+                            tTimeout = Cr;
+                        }
+                        else if ( _N_Ar<getTicksRx())
+                        {
+                            resetRxLED();
+                            LOG2_OK( "Time out( N_Ar ): %d", _N_Ar );
+                            _nResultRx = N_TIMEOUT_Ar;
+                            _oState = START;
+                        }
+                    }
+                    else if ( _N_Br<getTicksRx())
+                    {
+                        resetRxLED();
+                        LOG2_OK( "Time out( N_Br ): %d", _N_Br );
+                        _nResultRx = N_TIMEOUT_Br;
+                        _oState = START;
+                    }
+                }
+                else if ( nibble2 == CFTYPE )  //Consecutive frame
+                {
+                    if ( _iState != RECEIVING_CF || _iState != SENDING_FC )
+                    {
+                        resetRxLED();
+                        LOG2_OK( "Unexpected PDU!" );
+                        retval = N_UNEXP_PDU_Rx;
+                        _oState = START;
+                    }
+                    else if ( _N_Cr >= getTicksRx())
+                    {
+                        resetRxLED();
+                        LOG2_OK( "Receiving the consecutive frame!" );
+                        _oState = MULTIPLE_FRAME;
+                        _iState = RECEIVING_CF;
+                        retval = isoTPHandleConsecutiveFrame( e_if, c_id, pc_pload, pc_ploadLen );
+                    }
+                    else if ( _N_Cr < getTicksRx())
+                    {
+                        resetRxLED();
+                        LOG2_OK( "Time out( N_Cr ): %d", _N_Cr );
+                        _nResultRx = N_TIMEOUT_Cr;
+                        _oState = START;
+                    }
+                }
+                else if ( nibble2 == FCTYPE && c_id  == _st_FCConf_t_Tx.srcID )
+                {
+                    LOG2_OK( "Calling the flow control callback function" );
+                    //tpReceiveRoute( 0, 1, FC_callback );
+                    retval = FC_callback( pc_pload );
+                }
+                else
+                {
+                    resetRxLED();
+                    retval = N_UNEXP_PDU_Rx;
+                    LOG2_OK( "Unexpected PDU" );
+                }
+                break;
+            case SINGLE_FRAME:
+                LOG2_OK( "Handling a single frame" );
+                retval = isoTPHandleSingleFrame( e_if, c_id, pc_pload, pc_ploadLen );
+                if ( retval == N_OK_Rx )
+                {
+                    LOG2_OK( "The single frame has been successfully stored" );
+                    _endMessage = 1;
+                    _oState = START;
+                }
+                break;
+            case MULTIPLE_FRAME:
+                    switch( _iState )
+                    {
+                        case RECEIVING_FF:
+                            LOG2_OK( "Handling the first frame!" );
+                            retval = isoTPHandleFirstFrame( e_if, c_id, pc_pload, pc_ploadLen );
+                            if ( retval == N_BUFFER_OVFLW_Rx )
+                            {
+                                resetRxLED();
+                                LOG2_OK( "Over flow!" );
+                                local_frame[0] = 0x32;     //Type|FS overflow
+                                ret = isoTpsend( _st_FCConf_t_Rx.e_if, local_frame, _st_FCConf_t_Rx.srcID, 3 ); //send the FC
+                                _oState = START;
+                            }
+                            else if ( retval == N_OK_Rx )
+                                _iState = SENDING_FC;
+                            break;
+                        case SENDING_FC:
+                            LOG2_OK( "Sending the flow control" );
+                            local_frame[0] = FCTYPE;     //Type|FS
+                            local_frame[1] = _st_FCConf_t_Rx.BS;     //BS
+                            local_frame[2] = _st_FCConf_t_Rx.STmin;     //stmin
+                            retval = isoTpsend( _st_FCConf_t_Rx.e_if, local_frame, _st_FCConf_t_Rx.srcID, 3 ); //send the FC
+                            if ( retval != CAN_TxStatus_NoMailBox && _N_Ar >= getTicksRx())
+                            {
+                                LOG2_OK( "Time stamp( N_Ar ): %d", getTicksRx());
+                                LOG2_OK( "The flow control has been successfully sent" );
+                                _iState = RECEIVING_CF;
+                                _N_Cr = getTicksRx()+RXTIMEOUT;
+                                LOG2_OK( "Time stamp( N_Cr ): %d", _N_Cr );
+                                LOG2_OK( "Receiving the Consecutive frame" );
+                                tTimeout = Cr;
+                            }
+                            else if ( _N_Ar < getTicksRx())
+                            {
+                                resetRxLED();
+                                LOG2_OK( "Time out( N_Ar ): %d", _N_Ar );
+                                _nResultRx = N_TIMEOUT_Ar;
+                                _oState = START;
+                            }
+                            break;
+                        case RECEIVING_CF:
+                            if ( _N_Cr >= getTicksRx())
+                            {
+                                LOG2_OK( "Time stamp( N_Cr ): %d", getTicksRx());
+                                LOG2_OK( "Handling the consecutive frame" );
+                                retval = isoTPHandleConsecutiveFrame( e_if, c_id, pc_pload, pc_ploadLen );
+                                //counter++;
+
+                             //  if ( ( counter*7+6 )>data_buf_length )
+                                  // pc_ploadLen = pc_ploadLen-( ( counter*7+6 )-data_buf_length )-1;
+                               // LOG_HEXDUMP( pc_pload, pc_ploadLen );
+                                if ( retval == N_WRONG_SN_Rx )
+                                    resetSCHRx();
+                                if ( retval == N_OK_Rx )
+                                {
+
+                                    _N_Cr = getTicksRx() + RXTIMEOUT;
+                                    LOG2_OK( "Time stamp( N_Cr ): %d", _N_Cr );
+                                    LOG2_OK( "The consecutive frame has been stored" );
+                                    tTimeout = Cr;
+                                    _oState = MULTIPLE_FRAME;
+                                    _iState = RECEIVING_CF;
+                                    _BSRXCurrent++;
+                                    if ( _BSRXCurrent >= _st_FCConf_t_Rx.BS )
+                                    {
+                                        _iState = SENDING_FC;
+                                        _BSRXCurrent = 0;
+                                    }
+                                }
+                                else if ( retval == MESSAGE_COMPLETE )
+                                {
+                                    resetRxLED();
+                                    //GPIO_ResetBits( GPIOD, GPIO_Pin_15 );
+                                    LOG2_OK( "Message complete!" );
+                                    _endMessage = 1;
+                                    _oState = START;
+                                    _iState = RECEIVING_FF;
+                                }
+                                else
+                                    return retval;
+                            }
+                            else
+                            {
+                                LOG2_OK( "Time stamp( N_Cr ): %d", _N_Cr );
+                                _nResultRx = N_TIMEOUT_Cr;
+                                _oState = START;
+                            }
+                          break;
+                        default:
+                            retval = N_ERROR_Rx;
+                            resetRxLED();
+                            _oState = START;
+                            break;
+                    }
+                    break;
+            default:
+                retval = N_ERROR_Rx;
+                resetRxLED();
+                _oState = START;
+                break;
+
+        }
+   }
+}
+/* --- EOF ----------------------------------------------------------------- */
+
+
+
+
+
+
+
+
+
