@@ -30,7 +30,8 @@ Secure, non-blocking, full-duplex ISO-TP (ISO 15765-2) implementation for CAN-ba
 Modern in-vehicle networks (IVNs) are exposed to eavesdropping, message injection, and DoS attacks. This project provides:
 
 - **ISO-TP (ISO 15765-2)** transport layer over CAN for messages up to 4095 bytes.  
-- **emb::TLS** integration for mutual authentication, confidentiality, and integrity on deeply embedded ECUs.
+
+ Note: emb::TLS** integration "can" be made for mutual authentication, confidentiality, and integrity on deeply embedded ECUs.
 
 All designed for resource-constrained microcontrollers (e.g., ARM Cortex-M) to secure ECU-to-gateway channels.
 
