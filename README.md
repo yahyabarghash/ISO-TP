@@ -31,7 +31,8 @@ Modern in-vehicle networks (IVNs) are exposed to eavesdropping, message injectio
 
 - **ISO-TP (ISO 15765-2)** transport layer over CAN for messages up to 4095 bytes.  
 
- Note: emb::TLS** integration "can" be made for mutual authentication, confidentiality, and integrity on deeply embedded ECUs.
+ Note: This repo ships only the ISO-TP stack itself and the “emb::TLS integration” is provided conceptually—you get the hooks and the transport layer over which you can run a TLS 1.2 handshake, but the emb::TLS library       sources are not bundled here.
+   emb::TLS integration "can" be made for mutual authentication, confidentiality, and integrity on deeply embedded ECUs.
 
 All designed for resource-constrained microcontrollers (e.g., ARM Cortex-M) to secure ECU-to-gateway channels.
 
