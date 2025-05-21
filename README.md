@@ -157,7 +157,7 @@ typedef void (*isotp_callback_t)(uint32_t task_id, N_Result_t status);
   - ISO-TP alone: ~9.8 KB SRAM  
   - ISO-TP + emb::TLS: ~110 KB SRAM
 
-See [Measurements & Analysis](./docs/Measurements.md) for full test results.
+
 
 ---
 
